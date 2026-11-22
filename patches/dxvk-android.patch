@@ -1,0 +1,411 @@
+diff --git a/meson.build b/meson.build
+index 4964301..4fe4270 100644
+--- a/meson.build
++++ b/meson.build
+@@ -161,7 +161,12 @@ else
+   if lib_glfw.found()
+     compiler_args += ['-DDXVK_WSI_GLFW']
+   endif
+-  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
++  # HyperWin: an Android WSI, a window being an ANativeWindow.
++  if host_machine.system() == 'android'
++    compiler_args += ['-DDXVK_WSI_ANDROID']
++    link_args += ['-landroid']
++  endif
++  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found() and host_machine.system() != 'android')
+     error('SDL3, SDL2, or GLFW are required to build dxvk-native')
+   endif
+   
+diff --git a/src/dxgi/dxgi.sym b/src/dxgi/dxgi.sym
+index d527d64..6d9260f 100644
+--- a/src/dxgi/dxgi.sym
++++ b/src/dxgi/dxgi.sym
+@@ -5,6 +5,8 @@
+     CreateDXGIFactory;
+     DXGIDeclareAdapterRemovalSupport;
+     DXGIGetDebugInterface1;
++    hwd3d_set_program;
++    hwd3d_abi_version;
+ 
+   local:
+     *;
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 63d89d9..acd96d3 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -47,6 +47,8 @@ namespace dxvk {
+     HANDLE_EXT(khrDeviceFault);                    \
+     HANDLE_EXT(khrDynamicRenderingLocalRead);      \
+     HANDLE_EXT(khrExternalMemoryWin32);            \
++    HANDLE_EXT(androidExternalMemoryAhb);          \
++    HANDLE_EXT(extQueueFamilyForeign);             \
+     HANDLE_EXT(khrExternalSemaphoreWin32);         \
+     HANDLE_EXT(khrIncrementalPresent);             \
+     HANDLE_EXT(khrLoadStoreOpNone);                \
+@@ -1022,6 +1024,10 @@ namespace dxvk {
+ 
+       /* External memory features for wine */
+       ENABLE_EXT(khrExternalMemoryWin32, false),
++
++      /* HyperWin: surfaces shared between programs as Android hardware buffers */
++      ENABLE_EXT(androidExternalMemoryAhb, false),
++      ENABLE_EXT(extQueueFamilyForeign, false),
+       ENABLE_EXT(khrExternalSemaphoreWin32, false),
+ 
+       /* Dirty rects for presentation */
+diff --git a/src/dxvk/dxvk_device_info.h b/src/dxvk/dxvk_device_info.h
+index 54deab3..ac93088 100644
+--- a/src/dxvk/dxvk_device_info.h
++++ b/src/dxvk/dxvk_device_info.h
+@@ -90,6 +90,8 @@ namespace dxvk {
+     VkPhysicalDeviceFaultFeaturesKHR                          khrDeviceFault                  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_KHR };
+     VkPhysicalDeviceDynamicRenderingLocalReadFeatures         khrDynamicRenderingLocalRead    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR };
+     VkBool32                                                  khrExternalMemoryWin32          = VK_FALSE;
++    VkBool32                                                  androidExternalMemoryAhb        = VK_FALSE;
++    VkBool32                                                  extQueueFamilyForeign           = VK_FALSE;
+     VkBool32                                                  khrExternalSemaphoreWin32       = VK_FALSE;
+     VkBool32                                                  khrIncrementalPresent           = VK_FALSE;
+     VkBool32                                                  khrLoadStoreOpNone              = VK_FALSE;
+@@ -166,6 +168,8 @@ namespace dxvk {
+     VkExtensionProperties khrDeviceFault                    = vk::makeExtension(VK_KHR_DEVICE_FAULT_EXTENSION_NAME);
+     VkExtensionProperties khrDynamicRenderingLocalRead      = vk::makeExtension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+     VkExtensionProperties khrExternalMemoryWin32            = vk::makeExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
++    VkExtensionProperties androidExternalMemoryAhb          = vk::makeExtension("VK_ANDROID_external_memory_android_hardware_buffer");
++    VkExtensionProperties extQueueFamilyForeign             = vk::makeExtension("VK_EXT_queue_family_foreign");
+     VkExtensionProperties khrExternalSemaphoreWin32         = vk::makeExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+     VkExtensionProperties khrIncrementalPresent             = vk::makeExtension(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
+     VkExtensionProperties khrLoadStoreOpNone                = vk::makeExtension(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME);
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index f93ae8d..ee857d9 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -108,6 +108,11 @@ namespace dxvk {
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+     }
+ 
++#ifdef __ANDROID__
++    if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++      m_acquireStatus = VK_SUCCESS;  // as at present, above
++#endif
++
+     // This is a normal occurence, but may be useful for
+     // debugging purposes in case WSI goes wrong somehow.
+     if (m_acquireStatus != VK_SUCCESS && m_swapchain)
+@@ -227,6 +232,13 @@ namespace dxvk {
+     VkResult status = m_vkd->vkQueuePresentKHR(
+       m_device->queues().graphics.queueHandle, &info);
+ 
++#ifdef __ANDROID__
++    // HyperWin: Android calls every frame suboptimal while the screen is rotated against the
++    // swap chain's identity transform. The compositor rotates it; recreating would not help.
++    if (status == VK_SUBOPTIMAL_KHR)
++      status = VK_SUCCESS;
++#endif
++
+     // Maintain valid state if presentation succeeded, even if we want to
+     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
+     // semaphore and fence signals, still happen if present fails with
+@@ -269,6 +281,10 @@ namespace dxvk {
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++#ifdef __ANDROID__
++      if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++        m_acquireStatus = VK_SUCCESS;
++#endif
+     }
+ 
+     // Recreate the swapchain on the next acquire, even if we get suboptimal.
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index 2b7ced4..ede217d 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -1761,7 +1761,9 @@ namespace dxvk {
+     // Open the file if it exists
+     std::ifstream stream(str::topath(filePath.c_str()).c_str());
+ 
+-    if (!stream && confLine.empty())
++    const std::string& hwConf = env::getHwd3dConf();
++
++    if (!stream && confLine.empty() && hwConf.empty())
+       return config;
+ 
+     // Initialize parser context
+@@ -1780,6 +1782,20 @@ namespace dxvk {
+         parseUserConfigLine(config, ctx, line);
+     }
+ 
++    // HyperWin: the program's own dxvk.conf, sent with its hello.
++    if (!hwConf.empty()) {
++      Logger::info("Found the program's dxvk.conf");
++
++      std::istringstream hw(hwConf);
++      std::string line;
++
++      while (std::getline(hw, line)) {
++        if (!line.empty() && line.back() == '\r')
++          line.pop_back();
++        parseUserConfigLine(config, ctx, line);
++      }
++    }
++
+     if (!confLine.empty()) {
+       ctx.active = true;
+ 
+diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
+index 556327c..e13b3e4 100644
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -64,7 +64,8 @@ namespace dxvk::env {
+ 
+   std::string getExeName() {
+     std::string fullPath = getExePath();
+-    auto n = fullPath.find_last_of(env::PlatformDirSlash);
++    // HyperWin: the program's path is Windows' (backslashes), which DXVK's profiles are written for.
++    auto n = fullPath.find_last_of("/\\");
+     
+     return (n != std::string::npos)
+       ? fullPath.substr(n + 1)
+@@ -85,7 +86,15 @@ namespace dxvk::env {
+   }
+ 
+ 
++  // HyperWin: the program being drawn for is not this process. libhwd3d.so names it, per channel
++  // thread, before it creates a factory or a device (hwd3d_set_program).
++  thread_local std::string g_hwd3dExe, g_hwd3dConf;
++
++  const std::string& getHwd3dConf() { return g_hwd3dConf; }
++
+   std::string getExePath() {
++    if (!g_hwd3dExe.empty())
++      return g_hwd3dExe;
+ #if defined(_WIN32)
+     std::vector<WCHAR> exePath;
+     exePath.resize(MAX_PATH + 1);
+@@ -161,3 +170,14 @@ namespace dxvk::env {
+   }
+   
+ }
++
++extern "C" __attribute__((visibility("default"))) void hwd3d_set_program(const char* exe, const char* conf) {
++  dxvk::env::g_hwd3dExe = exe ? exe : "";
++  dxvk::env::g_hwd3dConf = conf ? conf : "";
++}
++
++// HyperWin: the HwD3D ABI this build was patched for. libhwd3d.so refuses a DXVK whose number differs
++// from its own (the app does the same with the zip's meta.json), since the two sides call each other.
++extern "C" __attribute__((visibility("default"))) unsigned hwd3d_abi_version() {
++  return 1;
++}
+diff --git a/src/util/util_env.h b/src/util/util_env.h
+index 80b4a65..d698e80 100644
+--- a/src/util/util_env.h
++++ b/src/util/util_env.h
+@@ -66,6 +66,10 @@ namespace dxvk::env {
+    * \returns Path to executable
+    */
+   std::string getExePath();
++
++  // HyperWin: the dxvk.conf of the program being drawn for, or empty.
++  const std::string& getHwd3dConf();
++  extern thread_local std::string g_hwd3dExe, g_hwd3dConf;
+   
+   /**
+    * \brief Sets name of the calling thread
+diff --git a/src/util/util_singleton.h b/src/util/util_singleton.h
+index ee5fe56..27253fb 100644
+--- a/src/util/util_singleton.h
++++ b/src/util/util_singleton.h
+@@ -20,9 +20,10 @@ public:
+   Rc<T> acquire(Args... constantArgs) {
+     std::lock_guard lock(m_mutex);
+ 
+-    if (!(m_useCount++))
++    if (!m_useCount)
+       m_object = new T(constantArgs...);
+ 
++    m_useCount++;
+     return m_object;
+   }
+ 
+diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
+index f9d1e98..d20b30b 100644
+--- a/src/vulkan/vulkan_loader.cpp
++++ b/src/vulkan/vulkan_loader.cpp
+@@ -10,6 +10,20 @@
+ namespace dxvk::vk {
+ 
+   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
++#ifdef __ANDROID__
++    // HyperWin: the driver wrapper the renderer uses (HWGPU_VK_LOADER, e.g.
++    // libvulkan_passthrough.so), an ICD with vk_icdGetInstanceProcAddr.
++    if (const char* wrapper = getenv("HWGPU_VK_LOADER")) {
++      if (HMODULE library = LoadLibraryA(wrapper)) {
++        auto proc = GetProcAddress(library, "vk_icdGetInstanceProcAddr");
++        if (proc) {
++          Logger::info(str::format("Vulkan: using ", wrapper));
++          return std::make_pair(library, reinterpret_cast<PFN_vkGetInstanceProcAddr>(proc));
++        }
++        FreeLibrary(library);
++      }
++    }
++#endif
+     static const std::array<const char*, 2> dllNames = {{
+ #ifdef _WIN32
+       "winevulkan.dll",
+diff --git a/src/wsi/android/wsi_android.cpp b/src/wsi/android/wsi_android.cpp
+new file mode 100644
+index 0000000..7df7f7e
+--- /dev/null
++++ b/src/wsi/android/wsi_android.cpp
+@@ -0,0 +1,101 @@
++#if defined(DXVK_WSI_ANDROID)
++
++// HyperWin (d3d/README.md): a window is an ANativeWindow, which the app lends the renderer for a
++// Windows program's window; one monitor, the phone's screen. Nothing here owns a window, so mode
++// and fullscreen changes are no-ops and always succeed.
++
++#include "../wsi_platform.h"
++#include "../wsi_monitor.h"
++#include "../../util/util_error.h"
++#include "../../util/util_string.h"
++#include "../../util/util_env.h"
++
++#include <android/native_window.h>
++#include <vulkan/vulkan_android.h>
++
++namespace dxvk::wsi {
++
++  class AndroidWsiDriver : public WsiDriver {
++  public:
++    std::vector<const char *> getInstanceExtensions() override {
++      return { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
++    }
++
++    HMONITOR getDefaultMonitor() override { return monitor(); }
++    HMONITOR enumMonitors(uint32_t index) override { return index ? nullptr : monitor(); }
++    HMONITOR enumMonitors(const LUID *[], uint32_t, uint32_t index) override { return enumMonitors(index); }
++
++    bool getDisplayName(HMONITOR, WCHAR (&Name)[32]) override {
++      const WCHAR name[] = L"\\\\.\\DISPLAY1";
++      for (size_t i = 0; i < 32; i++) Name[i] = i < sizeof(name) / sizeof(WCHAR) ? name[i] : 0;
++      return true;
++    }
++
++    bool getDesktopCoordinates(HMONITOR, RECT* pRect) override {
++      WsiMode m;
++      getCurrentDisplayMode(nullptr, &m);
++      *pRect = { 0, 0, LONG(m.width), LONG(m.height) };
++      return true;
++    }
++
++    bool getDisplayMode(HMONITOR h, uint32_t modeNumber, WsiMode* pMode) override {
++      return modeNumber == 0 && getCurrentDisplayMode(h, pMode);
++    }
++
++    // The screen's size and rate: HWGPU_SCREEN="width height hz", else 1920x1080 at 60.
++    bool getCurrentDisplayMode(HMONITOR, WsiMode* pMode) override {
++      uint32_t w = 1920, h = 1080, hz = 60;
++      std::string s = env::getEnvVar("HWGPU_SCREEN");
++      if (!s.empty()) sscanf(s.c_str(), "%u %u %u", &w, &h, &hz);
++      *pMode = { w, h, { hz, 1 }, 32, false };
++      return true;
++    }
++
++    bool getDesktopDisplayMode(HMONITOR h, WsiMode* pMode) override { return getCurrentDisplayMode(h, pMode); }
++    WsiEdidData getMonitorEdid(HMONITOR) override { return {}; }
++
++    void getWindowSize(HWND hWindow, uint32_t* pWidth, uint32_t* pHeight) override {
++      auto* w = reinterpret_cast<ANativeWindow*>(hWindow);
++      if (pWidth) *pWidth = w ? uint32_t(ANativeWindow_getWidth(w)) : 0;
++      if (pHeight) *pHeight = w ? uint32_t(ANativeWindow_getHeight(w)) : 0;
++    }
++
++    void resizeWindow(HWND, DxvkWindowState*, uint32_t, uint32_t) override { }
++    void saveWindowState(HWND, DxvkWindowState*, bool) override { }
++    void restoreWindowState(HWND, DxvkWindowState*, bool) override { }
++    bool setWindowMode(HMONITOR, HWND, DxvkWindowState*, const WsiMode&) override { return true; }
++    bool enterFullscreenMode(HMONITOR, HWND, DxvkWindowState*, bool) override { return true; }
++    bool leaveFullscreenMode(HWND, DxvkWindowState*) override { return true; }
++    bool restoreDisplayMode() override { return true; }
++    HMONITOR getWindowMonitor(HWND) override { return monitor(); }
++    bool isWindow(HWND hWindow) override { return hWindow != nullptr; }
++    bool isMinimized(HWND) override { return false; }
++    bool isOccluded(HWND) override { return false; }
++    void updateFullscreenWindow(HMONITOR, HWND, bool) override { }
++
++    VkResult createSurface(HWND hWindow, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
++                           VkSurfaceKHR* pSurface) override {
++      auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(gipa(instance, "vkCreateAndroidSurfaceKHR"));
++      if (!create || !hWindow) return VK_ERROR_INITIALIZATION_FAILED;
++      VkAndroidSurfaceCreateInfoKHR info = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
++      info.window = reinterpret_cast<ANativeWindow*>(hWindow);
++      return create(instance, &info, nullptr, pSurface);
++    }
++
++  private:
++    static HMONITOR monitor() { return reinterpret_cast<HMONITOR>(uintptr_t(1)); }
++  };
++
++  static bool createAndroidWsiDriver(WsiDriver **driver) {
++    *driver = new AndroidWsiDriver();
++    return true;
++  }
++
++  WsiBootstrap AndroidWSI = {
++    "Android",
++    createAndroidWsiDriver
++  };
++
++}
++
++#endif
+diff --git a/src/wsi/meson.build b/src/wsi/meson.build
+index 1d88e2c..58520e8 100644
+--- a/src/wsi/meson.build
++++ b/src/wsi/meson.build
+@@ -13,6 +13,7 @@ wsi_src = [
+   'glfw/wsi_monitor_glfw.cpp',
+   'glfw/wsi_platform_glfw.cpp',
+   'glfw/wsi_window_glfw.cpp',
++  'android/wsi_android.cpp',
+ ]
+ 
+ wsi_deps = [ dep_displayinfo ]
+diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
+index 08f456e..d7f1b68 100644
+--- a/src/wsi/wsi_platform.cpp
++++ b/src/wsi/wsi_platform.cpp
+@@ -20,6 +20,9 @@ namespace dxvk::wsi {
+ #endif
+ #if defined(DXVK_WSI_GLFW)
+     &GlfwWSI,
++#endif
++#if defined(DXVK_WSI_ANDROID)
++    &AndroidWSI,
+ #endif
+   };
+ 
+@@ -33,6 +36,8 @@ namespace dxvk::wsi {
+         // for other platforms however we _need_ to know which WSI to use!
+ #if defined(DXVK_WSI_WIN32)
+         hint = "Win32";
++#elif defined(DXVK_WSI_ANDROID)
++        hint = "Android";
+ #else
+         throw DxvkError("DXVK_WSI_DRIVER environment variable unset");
+ #endif
+diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
+index f1fae3f..97433d7 100644
+--- a/src/wsi/wsi_platform.h
++++ b/src/wsi/wsi_platform.h
+@@ -123,6 +123,9 @@ namespace dxvk::wsi {
+ #if defined(DXVK_WSI_GLFW)
+   extern WsiBootstrap GlfwWSI;
+ #endif
++#if defined(DXVK_WSI_ANDROID)
++  extern WsiBootstrap AndroidWSI;
++#endif
+ 
+   void init();
+   void quit();
