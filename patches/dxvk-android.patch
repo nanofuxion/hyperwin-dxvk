@@ -16,6 +16,32 @@ index 4964301..4fe4270 100644
      error('SDL3, SDL2, or GLFW are required to build dxvk-native')
    endif
    
+diff --git a/src/d3d11/d3d11.sym b/src/d3d11/d3d11.sym
+index 71fa296..4d8e2c1 100644
+--- a/src/d3d11/d3d11.sym
++++ b/src/d3d11/d3d11.sym
+@@ -4,6 +4,8 @@
+     D3D11CreateDevice;
+     D3D11CreateDeviceAndSwapChain;
+     D3D11On12CreateDevice;
++    hwd3d_set_program;
++    hwd3d_abi_version;
+ 
+   local:
+     *;
+diff --git a/src/d3d9/d3d9.sym b/src/d3d9/d3d9.sym
+index 4d5c9a1..7e9f4b2 100644
+--- a/src/d3d9/d3d9.sym
++++ b/src/d3d9/d3d9.sym
+@@ -18,6 +18,8 @@
+     Direct3D9ForceHybridEnumeration;
+     Direct3DCreate9On12;
+     Direct3DCreate9On12Ex;
++    hwd3d_set_program;
++    hwd3d_abi_version;
+ 
+   local:
+     *;
 diff --git a/src/dxgi/dxgi.sym b/src/dxgi/dxgi.sym
 index d527d64..6d9260f 100644
 --- a/src/dxgi/dxgi.sym
@@ -33,17 +59,14 @@ diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
 index 63d89d9..acd96d3 100644
 --- a/src/dxvk/dxvk_device_info.cpp
 +++ b/src/dxvk/dxvk_device_info.cpp
-@@ -47,6 +47,8 @@ namespace dxvk {
-     HANDLE_EXT(khrDeviceFault);                    \
-     HANDLE_EXT(khrDynamicRenderingLocalRead);      \
+@@ -42,4 +42,6 @@ namespace dxvk {
+     HANDLE_EXT(extVertexAttributeDivisor);         \
      HANDLE_EXT(khrExternalMemoryWin32);            \
 +    HANDLE_EXT(androidExternalMemoryAhb);          \
 +    HANDLE_EXT(extQueueFamilyForeign);             \
      HANDLE_EXT(khrExternalSemaphoreWin32);         \
-     HANDLE_EXT(khrIncrementalPresent);             \
      HANDLE_EXT(khrLoadStoreOpNone);                \
-@@ -1022,6 +1024,10 @@ namespace dxvk {
- 
+@@ -865,5 +867,9 @@ namespace dxvk {
        /* External memory features for wine */
        ENABLE_EXT(khrExternalMemoryWin32, false),
 +
@@ -52,28 +75,24 @@ index 63d89d9..acd96d3 100644
 +      ENABLE_EXT(extQueueFamilyForeign, false),
        ENABLE_EXT(khrExternalSemaphoreWin32, false),
  
-       /* Dirty rects for presentation */
+       /* LOAD_OP_NONE for certain tiler optimizations */
 diff --git a/src/dxvk/dxvk_device_info.h b/src/dxvk/dxvk_device_info.h
 index 54deab3..ac93088 100644
 --- a/src/dxvk/dxvk_device_info.h
 +++ b/src/dxvk/dxvk_device_info.h
-@@ -90,6 +90,8 @@ namespace dxvk {
-     VkPhysicalDeviceFaultFeaturesKHR                          khrDeviceFault                  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_KHR };
-     VkPhysicalDeviceDynamicRenderingLocalReadFeatures         khrDynamicRenderingLocalRead    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR };
+@@ -80,4 +80,6 @@ namespace dxvk {
+     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT         extVertexAttributeDivisor       = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES };
      VkBool32                                                  khrExternalMemoryWin32          = VK_FALSE;
 +    VkBool32                                                  androidExternalMemoryAhb        = VK_FALSE;
 +    VkBool32                                                  extQueueFamilyForeign           = VK_FALSE;
      VkBool32                                                  khrExternalSemaphoreWin32       = VK_FALSE;
-     VkBool32                                                  khrIncrementalPresent           = VK_FALSE;
      VkBool32                                                  khrLoadStoreOpNone              = VK_FALSE;
-@@ -166,6 +168,8 @@ namespace dxvk {
-     VkExtensionProperties khrDeviceFault                    = vk::makeExtension(VK_KHR_DEVICE_FAULT_EXTENSION_NAME);
-     VkExtensionProperties khrDynamicRenderingLocalRead      = vk::makeExtension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+@@ -137,4 +139,6 @@ namespace dxvk {
+     VkExtensionProperties extVertexAttributeDivisor         = vk::makeExtension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
      VkExtensionProperties khrExternalMemoryWin32            = vk::makeExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
 +    VkExtensionProperties androidExternalMemoryAhb          = vk::makeExtension("VK_ANDROID_external_memory_android_hardware_buffer");
 +    VkExtensionProperties extQueueFamilyForeign             = vk::makeExtension("VK_EXT_queue_family_foreign");
      VkExtensionProperties khrExternalSemaphoreWin32         = vk::makeExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
-     VkExtensionProperties khrIncrementalPresent             = vk::makeExtension(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
      VkExtensionProperties khrLoadStoreOpNone                = vk::makeExtension(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME);
 diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
 index f93ae8d..ee857d9 100644
@@ -258,7 +277,7 @@ new file mode 100644
 index 0000000..7df7f7e
 --- /dev/null
 +++ b/src/wsi/android/wsi_android.cpp
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +#if defined(DXVK_WSI_ANDROID)
 +
 +// HyperWin (d3d/README.md): a window is an ANativeWindow, which the app lends the renderer for a
@@ -322,11 +341,12 @@ index 0000000..7df7f7e
 +    }
 +
 +    void resizeWindow(HWND, DxvkWindowState*, uint32_t, uint32_t) override { }
-+    void saveWindowState(HWND, DxvkWindowState*, bool) override { }
-+    void restoreWindowState(HWND, DxvkWindowState*, bool) override { }
++    void saveWindowState(HWND, DxvkWindowState*, bool) { }
++    void restoreWindowState(HWND, DxvkWindowState*, bool) { }
 +    bool setWindowMode(HMONITOR, HWND, DxvkWindowState*, const WsiMode&) override { return true; }
 +    bool enterFullscreenMode(HMONITOR, HWND, DxvkWindowState*, bool) override { return true; }
-+    bool leaveFullscreenMode(HWND, DxvkWindowState*) override { return true; }
++    bool leaveFullscreenMode(HWND, DxvkWindowState*) { return true; }
++    bool leaveFullscreenMode(HWND, DxvkWindowState*, bool) { return true; }
 +    bool restoreDisplayMode() override { return true; }
 +    HMONITOR getWindowMonitor(HWND) override { return monitor(); }
 +    bool isWindow(HWND hWindow) override { return hWindow != nullptr; }

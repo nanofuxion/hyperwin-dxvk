@@ -1,0 +1,1829 @@
+diff --git a/meson.build b/meson.build
+index 0e05948..cb60f2f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -113,6 +113,32 @@ if platform == 'windows'
+   endif
+ 
+   compiler_args += ['-DDXVK_WSI_WIN32']
++  dxvk_is_native = false
++  dxvk_name_prefix = ''
++else
++  dxvk_is_native = true
++  dxvk_name_prefix = 'libdxvk_'
++  dxvk_include_dirs += [
++    './include/native/directx',
++    './include/native/windows',
++    './include/native/wsi',
++  ]
++  compiler_args += [
++    '-DDXVK_NATIVE',
++    '-fPIC',
++    '-fvisibility=hidden',
++    '-Wno-unknown-pragmas',
++    '-Wno-overloaded-virtual',
++    '-Wno-non-virtual-dtor',
++  ]
++  if platform == 'android'
++    compiler_args += ['-DDXVK_WSI_ANDROID']
++    link_args += ['-landroid', '-llog']
++  endif
++  lib_dl = cpp.find_library('dl', required : false)
++  lib_d3d9 = dependency('', required : false)
++  lib_d3d11 = dependency('', required : false)
++  lib_dxgi = dependency('', required : false)
+ endif
+ 
+ dxvk_include_path = include_directories(dxvk_include_dirs)
+@@ -123,8 +149,8 @@ add_project_link_arguments(cpp.get_supported_link_arguments(link_args), language
+ add_project_link_arguments(cc.get_supported_link_arguments(link_args), language: 'c')
+ 
+ exe_ext = ''
+-dll_ext = ''
+-def_spec_ext = '.def'
++dll_ext = dxvk_is_native ? get_option('lib_suffix') : ''
++def_spec_ext = dxvk_is_native ? '.sym' : '.def'
+ 
+ glsl_compiler = find_program('glslang', 'glslangValidator')
+ glsl_args = [
+@@ -146,8 +172,4 @@ dxvk_version = vcs_tag(
+   output: 'version.h',
+ )
+ 
+-if platform != 'windows'
+-  error('Non-Windows platforms not supported... yet.')
+-endif
+-
+ subdir('src')
+diff --git a/meson_options.txt b/meson_options.txt
+index acd746e..69ebb3b 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -5,3 +5,4 @@ option('enable_d3d9',  type : 'boolean', value : true, description: 'Build D3D9'
+ option('enable_d3d10', type : 'boolean', value : true, description: 'Build D3D10')
+ option('enable_d3d11', type : 'boolean', value : true, description: 'Build D3D11')
+ option('build_id',     type : 'boolean', value : false)
++option('lib_suffix',   type : 'string',  value : '', description: 'Suffix appended to native library names (for side-by-side loading)')
+diff --git a/src/d3d10/meson.build b/src/d3d10/meson.build
+index 2032493..cb4f40a 100644
+--- a/src/d3d10/meson.build
++++ b/src/d3d10/meson.build
+@@ -1,15 +1,17 @@
+-d3d10_core_res = wrc_generator.process('version10_core.rc')
++d3d10_core_res = dxvk_is_native ? [] : wrc_generator.process('version10_core.rc')
+ 
+ d3d10_core_src = [
+   'd3d10_core.cpp',
+ ]
+ 
++d3d10_core_link_args = dxvk_is_native ? ['-Wl,--version-script=' + meson.current_source_dir() + '/d3d10core.sym'] : []
++
+ d3d10_core_dll = shared_library('d3d10core'+dll_ext, d3d10_core_src, d3d10_core_res,
+-  name_prefix         : '',
++  name_prefix         : dxvk_name_prefix,
+   dependencies        : [ d3d11_dep ],
+   include_directories : dxvk_include_path,
++  link_args           : d3d10_core_link_args,
+   install             : true,
+-  vs_module_defs      : 'd3d10core'+def_spec_ext,
+ )
+ 
+ d3d10_core_dep = declare_dependency(
+diff --git a/src/d3d11/d3d11_annotation.cpp b/src/d3d11/d3d11_annotation.cpp
+index eef2617..3207949 100644
+--- a/src/d3d11/d3d11_annotation.cpp
++++ b/src/d3d11/d3d11_annotation.cpp
+@@ -8,6 +8,7 @@ namespace dxvk {
+ 
+   template <bool Register>
+   static void RegisterUserDefinedAnnotation(IDXVKUserDefinedAnnotation* annotation) {
++#ifdef _WIN32
+     using RegistrationFunctionType = void(__stdcall *)(IDXVKUserDefinedAnnotation*);
+     static const int16_t RegisterOrdinal = 28257;
+     static const int16_t UnregisterOrdinal = 28258;
+@@ -28,6 +29,7 @@ namespace dxvk {
+     }
+ 
+     registrationFunction(annotation);
++#endif
+   }
+ 
+   D3D11UserDefinedAnnotation::D3D11UserDefinedAnnotation(D3D11DeviceContext* ctx)
+diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
+index 76925a1..63699d0 100644
+--- a/src/d3d11/d3d11_context.cpp
++++ b/src/d3d11/d3d11_context.cpp
+@@ -290,6 +290,32 @@ namespace dxvk {
+   }
+ 
+ 
++  HRESULT D3D11DeviceContext::HwBlitSwapRB(ID3D11Resource* pDst, ID3D11Resource* pSrc, const D3D11_BOX* pBox) {
++    D3D10DeviceLock lock = LockContext();
++    auto dst = GetCommonTexture(pDst);
++    auto src = GetCommonTexture(pSrc);
++    if (!dst || !src || dst->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER ||
++        src->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER)
++      return E_INVALIDARG;
++    VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
++    VkExtent3D ext = src->GetImage()->info().extent;
++    VkImageBlit blit = {};
++    blit.srcSubresource = layers;
++    blit.dstSubresource = layers;
++    int32_t l = pBox ? int32_t(pBox->left) : 0, t = pBox ? int32_t(pBox->top) : 0;
++    int32_t r = pBox ? int32_t(pBox->right) : int32_t(ext.width), b = pBox ? int32_t(pBox->bottom) : int32_t(ext.height);
++    blit.srcOffsets[0] = blit.dstOffsets[0] = { l, t, 0 };
++    blit.srcOffsets[1] = blit.dstOffsets[1] = { r, b, 1 };
++    VkComponentMapping id = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
++                              VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
++    // A blit converts between the two formats by component, so colours stay colours whatever the byte order.
++    EmitCs([cDst = dst->GetImage(), cSrc = src->GetImage(), cBlit = blit, id] (DxvkContext* ctx) {
++      ctx->blitImage(cDst, id, cSrc, id, cBlit, VK_FILTER_NEAREST);
++    });
++    return S_OK;
++  }
++
++
+   void STDMETHODCALLTYPE D3D11DeviceContext::CopySubresourceRegion(
+           ID3D11Resource*                   pDstResource,
+           UINT                              DstSubresource,
+diff --git a/src/d3d11/d3d11_context.h b/src/d3d11/d3d11_context.h
+index 3bd60a5..5be25d7 100644
+--- a/src/d3d11/d3d11_context.h
++++ b/src/d3d11/d3d11_context.h
+@@ -38,6 +38,11 @@ namespace dxvk {
+     
+     void STDMETHODCALLTYPE DiscardResource(ID3D11Resource *pResource);
+ 
++    /* HyperWin: copies a region of one 2D texture into another at the same place, converting between their
++     * formats by component (a blit): RGBA into BGRA keeps the colours. Both must be real images (not staging
++     * buffers), subresource 0. The name is kept from its first use: red and blue end up where they belong. */
++    HRESULT HwBlitSwapRB(ID3D11Resource* pDst, ID3D11Resource* pSrc, const D3D11_BOX* pBox);
++
+     void STDMETHODCALLTYPE DiscardView(ID3D11View* pResourceView);
+ 
+     void STDMETHODCALLTYPE DiscardView1(
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index d3575cf..292930b 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -854,7 +854,9 @@ namespace dxvk {
+       m_eventSignal = new sync::CallbackFence();
+ 
+     m_eventSignal->setCallback(value, [hEvent] {
++#ifdef _WIN32
+       SetEvent(hEvent);
++#endif
+     });
+ 
+     EmitCs([
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 7f59769..d71cc95 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -2322,8 +2322,10 @@ namespace dxvk {
+     DxvkSharedTextureMetadata metadata;
+     bool ret = getSharedMetadata(ntHandle, &metadata, sizeof(metadata), NULL);
+ 
++#ifdef _WIN32
+     if (IsKmtHandle)
+       ::CloseHandle(ntHandle);
++#endif
+ 
+     if (!ret) {
+       Logger::warn("D3D11Device::OpenSharedResourceGeneric: Failed to get shared resource info for a texture");
+diff --git a/src/d3d11/d3d11_fence.cpp b/src/d3d11/d3d11_fence.cpp
+index 9914b1d..e975a8b 100644
+--- a/src/d3d11/d3d11_fence.cpp
++++ b/src/d3d11/d3d11_fence.cpp
+@@ -13,12 +13,14 @@ namespace dxvk {
+     fenceInfo.initialValue = InitialValue;
+     m_flags = Flags;
+ 
++#ifdef _WIN32
+     if (Flags & D3D11_FENCE_FLAG_SHARED) {
+       fenceInfo.sharedType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT;
+       if (hFence == nullptr)
+         hFence = INVALID_HANDLE_VALUE;
+       fenceInfo.sharedHandle = hFence;
+     }
++#endif
+ 
+     if (Flags & ~D3D11_FENCE_FLAG_SHARED)
+       Logger::err(str::format("Fence flags 0x", std::hex, Flags, " not supported"));
+@@ -84,7 +86,9 @@ namespace dxvk {
+     // For shared fences, calling vkWaitSemaphores here could alleviate the issue.
+ 
+     m_fence->enqueueWait(Value, [hEvent] {
++#ifdef _WIN32
+       SetEvent(hEvent);
++#endif
+     });
+ 
+     return S_OK;
+diff --git a/src/d3d11/d3d11_gdi.cpp b/src/d3d11/d3d11_gdi.cpp
+index d74bc09..979bd95 100644
+--- a/src/d3d11/d3d11_gdi.cpp
++++ b/src/d3d11/d3d11_gdi.cpp
+@@ -26,7 +26,11 @@ namespace dxvk {
+     desc.Width       = tex->Width;
+     desc.Height      = tex->Height;
+     desc.Pitch       = tex->Width * sizeof(uint32_t);
++#ifdef _WIN32
+     desc.hDeviceDc   = CreateCompatibleDC(nullptr);
++#else
++    desc.hDeviceDc   = nullptr;
++#endif
+     desc.pColorTable = nullptr;
+     desc.hDc         = nullptr;
+     desc.hBitmap     = nullptr;
+diff --git a/src/d3d11/d3d11_include.h b/src/d3d11/d3d11_include.h
+index 1598088..b2d8a09 100644
+--- a/src/d3d11/d3d11_include.h
++++ b/src/d3d11/d3d11_include.h
+@@ -24,7 +24,7 @@
+ // For some strange reason, we cannot use the structures
+ // directly, although others from the same header work.
+ // Some structures are missing from the mingw headers.
+-#ifndef _MSC_VER
++#if !defined(_MSC_VER) && !defined(DXVK_NATIVE)
+ #if !defined(__MINGW64_VERSION_MAJOR) || __MINGW64_VERSION_MAJOR < 9
+ typedef enum D3D11_FORMAT_SUPPORT2 { 
+   D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_ADD                                = 0x1,
+diff --git a/src/d3d11/d3d11_main.cpp b/src/d3d11/d3d11_main.cpp
+index d80d5de..c536d81 100644
+--- a/src/d3d11/d3d11_main.cpp
++++ b/src/d3d11/d3d11_main.cpp
+@@ -203,6 +203,13 @@ extern "C" {
+   }
+   
+ 
++  /* HyperWin: D3D11DeviceContext::HwBlitSwapRB for the phone side (gpu/host/hwd3d). */
++  DLLEXPORT HRESULT hwd3d11_blit_swap_rb(ID3D11DeviceContext* pContext, ID3D11Resource* pDst,
++                                         ID3D11Resource* pSrc, const D3D11_BOX* pBox) {
++    if (!pContext) return E_INVALIDARG;
++    return static_cast<D3D11DeviceContext*>(pContext)->HwBlitSwapRB(pDst, pSrc, pBox);
++  }
++
+   DLLEXPORT HRESULT __stdcall D3D11CreateDevice(
+           IDXGIAdapter*         pAdapter,
+           D3D_DRIVER_TYPE       DriverType,
+diff --git a/src/d3d11/d3d11_options.cpp b/src/d3d11/d3d11_options.cpp
+index dd24f6e..369729f 100644
+--- a/src/d3d11/d3d11_options.cpp
++++ b/src/d3d11/d3d11_options.cpp
+@@ -45,12 +45,15 @@ namespace dxvk {
+ 
+     auto cachedDynamicResources = config.getOption<std::string>("d3d11.cachedDynamicResources", std::string());
+ 
++#ifdef _WIN32
+     if (::GetModuleHandle("dxgitrace.dll")) {
+       // apitrace reads back all mapped resources on the CPU, so
+       // allocating everything in cached memory is necessary to
+       // achieve acceptable performance
+       this->cachedDynamicResources = ~0u;
+-    } else {
++    } else
++#endif
++    {
+       this->cachedDynamicResources = 0u;
+ 
+       for (char c : cachedDynamicResources) {
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 7a300c7..ac79734 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -182,6 +182,7 @@ namespace dxvk {
+     if (MaxLatency == 0 || MaxLatency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+       return DXGI_ERROR_INVALID_CALL;
+ 
++#ifdef _WIN32
+     if (m_frameLatencyEvent) {
+       // Windows DXGI does not seem to handle the case where the new maximum
+       // latency is less than the current value, and some games relying on
+@@ -190,6 +191,7 @@ namespace dxvk {
+       if (MaxLatency > m_frameLatency)
+         ReleaseSemaphore(m_frameLatencyEvent, MaxLatency - m_frameLatency, nullptr);
+     }
++#endif
+ 
+     m_frameLatency = MaxLatency;
+     return S_OK;
+@@ -389,8 +391,10 @@ namespace dxvk {
+   void D3D11SwapChain::CreateFrameLatencyEvent() {
+     m_frameLatencySignal = new sync::CallbackFence(m_frameId);
+ 
++#ifdef _WIN32
+     if (m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+       m_frameLatencyEvent = CreateSemaphore(nullptr, m_frameLatency, DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
++#endif
+   }
+ 
+ 
+@@ -555,7 +559,9 @@ namespace dxvk {
+ 
+ 
+   void D3D11SwapChain::DestroyFrameLatencyEvent() {
++#ifdef _WIN32
+     CloseHandle(m_frameLatencyEvent);
++#endif
+   }
+ 
+ 
+@@ -563,11 +569,13 @@ namespace dxvk {
+     // Wait for the sync event so that we respect the maximum frame latency
+     m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
+ 
++#ifdef _WIN32
+     if (m_frameLatencyEvent) {
+       m_frameLatencySignal->setCallback(m_frameId, [cFrameLatencyEvent = m_frameLatencyEvent] () {
+         ReleaseSemaphore(cFrameLatencyEvent, 1, nullptr);
+       });
+     }
++#endif
+   }
+ 
+ 
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index 428cea8..76ca9a3 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -63,7 +63,9 @@ namespace dxvk {
+       imageInfo.sharing.type = (m_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)
+         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+         : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
++#ifdef _WIN32
+       imageInfo.sharing.handle = hSharedHandle;
++#endif
+     }
+ 
+     if (!pDevice->GetOptions()->disableMsaa)
+@@ -639,8 +641,10 @@ namespace dxvk {
+       Logger::warn("D3D11: Failed to write shared resource info for a texture");
+     }
+ 
++#ifdef _WIN32
+     if (hSharedHandle != INVALID_HANDLE_VALUE)
+       CloseHandle(hSharedHandle);
++#endif
+   }
+ 
+ 
+diff --git a/src/d3d11/meson.build b/src/d3d11/meson.build
+index 85fe780..1207423 100644
+--- a/src/d3d11/meson.build
++++ b/src/d3d11/meson.build
+@@ -1,4 +1,4 @@
+-d3d11_res = wrc_generator.process('version.rc')
++d3d11_res = dxvk_is_native ? [] : wrc_generator.process('version.rc')
+ 
+ dxgi_common_src = [
+   '../dxgi/dxgi_format.cpp',
+@@ -66,13 +66,15 @@ d3d11_shaders = files([
+   'shaders/d3d11_video_blit_vert.vert',
+ ])
+ 
++d3d11_link_args = dxvk_is_native ? ['-Wl,--version-script=' + meson.current_source_dir() + '/d3d11.sym'] : []
++
+ d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src + d3d10_src,
+     glsl_generator.process(d3d11_shaders), d3d11_res,
+-  name_prefix         : '',
+-  dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep ],
++  name_prefix         : dxvk_name_prefix,
++  dependencies        : [ dxvk_is_native ? dxgi_dep : lib_dxgi, dxbc_dep, dxvk_dep ],
+   include_directories : dxvk_include_path,
++  link_args           : d3d11_link_args,
+   install             : true,
+-  vs_module_defs      : 'd3d11'+def_spec_ext,
+ )
+ 
+ d3d11_dep = declare_dependency(
+diff --git a/src/d3d8/meson.build b/src/d3d8/meson.build
+index c53b339..85f8f19 100644
+--- a/src/d3d8/meson.build
++++ b/src/d3d8/meson.build
+@@ -1,4 +1,4 @@
+-d3d8_res = wrc_generator.process('version.rc')
++d3d8_res = dxvk_is_native ? [] : wrc_generator.process('version.rc')
+ 
+ d3d8_src = [
+   'd3d8_buffer.cpp',
+@@ -15,12 +15,14 @@ d3d8_src = [
+   'd3d8_volume.cpp'
+ ]
+ 
++d3d8_link_args = dxvk_is_native ? ['-Wl,--version-script=' + meson.current_source_dir() + '/d3d8.sym'] : []
++
+ d3d8_dll = shared_library('d3d8'+dll_ext, d3d8_src, d3d8_res,
+-  name_prefix         : '',
+-  dependencies        : [ lib_d3d9, util_dep, dxso_dep, dxvk_dep ],
++  name_prefix         : dxvk_name_prefix,
++  dependencies        : [ dxvk_is_native ? d3d9_dep : lib_d3d9, util_dep, dxso_dep, dxvk_dep ],
+   include_directories : dxvk_include_path,
++  link_args           : d3d8_link_args,
+   install             : true,
+-  vs_module_defs      : 'd3d8'+def_spec_ext,
+ )
+ 
+ d3d8_dep = declare_dependency(
+diff --git a/src/d3d9/d3d9_adapter.cpp b/src/d3d9/d3d9_adapter.cpp
+index 654f999..64f462c 100644
+--- a/src/d3d9/d3d9_adapter.cpp
++++ b/src/d3d9/d3d9_adapter.cpp
+@@ -63,6 +63,7 @@ namespace dxvk {
+ 
+     const auto& props = m_adapter->deviceProperties();
+ 
++#ifdef _WIN32
+     DISPLAY_DEVICEA device = { };
+     device.cb = sizeof(device);
+ 
+@@ -70,6 +71,10 @@ namespace dxvk {
+       Logger::err("D3D9Adapter::GetAdapterIdentifier: Failed to query display info");
+       return D3DERR_INVALIDCALL;
+     }
++    const char* deviceName = device.DeviceName;
++#else
++    const char* deviceName = "\\\\.\\DISPLAY1";
++#endif
+ 
+     GUID guid          = bit::cast<GUID>(m_adapter->devicePropertiesExt().coreDeviceId.deviceUUID);
+ 
+@@ -137,7 +142,7 @@ namespace dxvk {
+     const char* driver = GetDriverDLL(DxvkGpuVendor(vendorId));
+ 
+     copyToStringArray(pIdentifier->Description, desc.c_str());
+-    copyToStringArray(pIdentifier->DeviceName,  device.DeviceName); // The GDI device name. Not the actual device name.
++    copyToStringArray(pIdentifier->DeviceName,  deviceName); // The GDI device name. Not the actual device name.
+     copyToStringArray(pIdentifier->Driver,      driver);            // This is the driver's dll.
+ 
+     const bool isExtended = m_parent->IsD3DCompatibile(D3DCompatibility::D3D9Ex);
+diff --git a/src/d3d9/d3d9_common_texture.cpp b/src/d3d9/d3d9_common_texture.cpp
+index 4bcb3ef..aa28d3f 100644
+--- a/src/d3d9/d3d9_common_texture.cpp
++++ b/src/d3d9/d3d9_common_texture.cpp
+@@ -273,7 +273,9 @@ namespace dxvk {
+       imageInfo.sharing.mode = (*pSharedHandle == INVALID_HANDLE_VALUE || *pSharedHandle == nullptr)
+         ? DxvkSharedHandleMode::Export
+         : DxvkSharedHandleMode::Import;
++#ifdef _WIN32
+       imageInfo.sharing.handle = *pSharedHandle;
++#endif
+       imageInfo.shared = true;
+       // TODO: validate metadata?
+     }
+@@ -551,8 +553,10 @@ namespace dxvk {
+       if (ntHandle == INVALID_HANDLE_VALUE || !setSharedMetadata(ntHandle, &metadata, sizeof(metadata)))
+         Logger::warn("D3D9: Failed to write shared resource info for a texture");
+ 
++#ifdef _WIN32
+       if (ntHandle != INVALID_HANDLE_VALUE)
+         ::CloseHandle(ntHandle);
++#endif
+     }
+   }
+ 
+diff --git a/src/d3d9/d3d9_cursor.cpp b/src/d3d9/d3d9_cursor.cpp
+index aab3199..43fe15b 100644
+--- a/src/d3d9/d3d9_cursor.cpp
++++ b/src/d3d9/d3d9_cursor.cpp
+@@ -8,17 +8,22 @@ namespace dxvk {
+   void D3D9Cursor::ResetCursor() {
+     ShowCursor(FALSE);
+ 
++#ifdef _WIN32
+     if (m_hCursor != nullptr) {
+       ResetHardwareCursor();
+-    } else if (m_sCursor.Bitmap != nullptr) {
++    } else
++#endif
++    if (m_sCursor.Bitmap != nullptr) {
+       ResetSoftwareCursor();
+     }
+   }
+ 
+   
+   void D3D9Cursor::ResetHardwareCursor() {
++#ifdef _WIN32
+     ::DestroyCursor(m_hCursor);
+     m_hCursor = nullptr;
++#endif
+   }
+ 
+ 
+@@ -39,21 +44,28 @@ namespace dxvk {
+     if (unlikely(m_sCursor.Bitmap != nullptr))
+       return;
+ 
++#ifdef _WIN32
+     POINT currentPos = { };
+     if (::GetCursorPos(&currentPos) && currentPos == POINT{ X, Y })
+         return;
+ 
+     ::SetCursorPos(X, Y);
++#endif
+   }
+ 
+ 
+   BOOL D3D9Cursor::ShowCursor(BOOL bShow) {
+     // Cursor visibility remains unchanged (typically FALSE) if the cursor isn't set.
++#ifdef _WIN32
+     if (unlikely(m_hCursor == nullptr && m_sCursor.Bitmap == nullptr))
+       return m_visible;
+ 
+     if (m_hCursor != nullptr)
+       ::SetCursor(bShow ? m_hCursor : nullptr);
++#else
++    if (unlikely(m_sCursor.Bitmap == nullptr))
++      return m_visible;
++#endif
+ 
+     return std::exchange(m_visible, bShow);
+   }
+@@ -63,6 +75,7 @@ namespace dxvk {
+     if (m_sCursor.Bitmap != nullptr)
+       ResetSoftwareCursor();
+ 
++#ifdef _WIN32
+     CursorMask mask;
+     std::memset(mask, ~0, sizeof(mask));
+ 
+@@ -80,16 +93,19 @@ namespace dxvk {
+ 
+     ::DeleteObject(info.hbmMask);
+     ::DeleteObject(info.hbmColor);
++#endif
+ 
+     ShowCursor(m_visible);
+   }
+ 
+   void D3D9Cursor::SetSoftwareCursor(UINT XHotSpot, UINT YHotSpot, Com<IDirect3DTexture9>&& pCursorBitmap) {
++#ifdef _WIN32
+     // Make sure to hide the win32 cursor
+     ::SetCursor(nullptr);
+ 
+     if (m_hCursor != nullptr)
+       ResetHardwareCursor();
++#endif
+ 
+     m_sCursor.Bitmap    = std::move(pCursorBitmap);
+     m_sCursor.XHotSpot  = XHotSpot;
+diff --git a/src/d3d9/d3d9_cursor.h b/src/d3d9/d3d9_cursor.h
+index add53a1..f087dc0 100644
+--- a/src/d3d9/d3d9_cursor.h
++++ b/src/d3d9/d3d9_cursor.h
+@@ -40,8 +40,10 @@ namespace dxvk {
+     BOOL ShowCursor(BOOL bShow);
+ 
+     ~D3D9Cursor() {
++#ifdef _WIN32
+       if (m_hCursor != nullptr)
+         ::DestroyCursor(m_hCursor);
++#endif
+     }
+ 
+     void SetHardwareCursor(UINT XHotSpot, UINT YHotSpot, const CursorBitmap& bitmap);
+@@ -62,7 +64,9 @@ namespace dxvk {
+ 
+     D3D9_SOFTWARE_CURSOR  m_sCursor;
+ 
++#ifdef _WIN32
+     HCURSOR               m_hCursor = nullptr;
++#endif
+ 
+   };
+ 
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index bda894f..a980fe9 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -7888,4 +7888,139 @@ namespace dxvk {
+     return m_csChunk->empty() ? m_csSeqNum : m_csSeqNum + 1;
+   }
+ 
++  HRESULT D3D9DeviceEx::BlitToVkImage(
++          IDirect3DSurface9* pSourceSurface,
++          VkImage            dstVkImage,
++          VkFormat           dstFormat,
++          uint32_t           dstWidth,
++          uint32_t           dstHeight) {
++    D3D9DeviceLock lock = LockDevice();
++
++    D3D9Surface* src = static_cast<D3D9Surface*>(pSourceSurface);
++    if (unlikely(src == nullptr || dstVkImage == VK_NULL_HANDLE || !dstWidth || !dstHeight))
++      return D3DERR_INVALIDCALL;
++
++    D3D9CommonTexture* srcTextureInfo = src->GetCommonTexture();
++    if (unlikely(srcTextureInfo == nullptr))
++      return D3DERR_INVALIDCALL;
++
++    Rc<DxvkImage> srcImage = srcTextureInfo->GetImage();
++    if (unlikely(srcImage == nullptr))
++      return D3DERR_INVALIDCALL;
++
++    Rc<DxvkImage> dstImage;
++    for (auto& e : m_scanoutImages) {
++      if (e.vkImage == dstVkImage && e.format == dstFormat && e.width == dstWidth && e.height == dstHeight) {
++        dstImage = e.image;
++        break;
++      }
++    }
++    if (dstImage == nullptr) {
++      DxvkImageCreateInfo imageInfo = {};
++      imageInfo.type        = VK_IMAGE_TYPE_2D;
++      imageInfo.format      = dstFormat;
++      imageInfo.flags       = 0;
++      imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
++      imageInfo.extent      = { dstWidth, dstHeight, 1u };
++      imageInfo.numLayers   = 1;
++      imageInfo.mipLevels   = 1;
++      imageInfo.usage       = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
++                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++                            | VK_IMAGE_USAGE_SAMPLED_BIT
++                            | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++      imageInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT
++                            | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
++                            | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++      imageInfo.access      = VK_ACCESS_TRANSFER_READ_BIT
++                            | VK_ACCESS_TRANSFER_WRITE_BIT
++                            | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
++                            | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
++                            | VK_ACCESS_SHADER_READ_BIT;
++      imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
++      // Kept in GENERAL, as the D3D11 path keeps its imported images. Clearing it first (initImage)
++      // and keeping it SHADER_READ_ONLY lost the device on Mali.
++      imageInfo.layout        = VK_IMAGE_LAYOUT_GENERAL;
++      imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      dstImage = m_dxvkDevice->createImageFromVkImage(imageInfo, dstVkImage);
++      auto& slot = m_scanoutImages[m_scanoutImageNext++ & 3u];
++      slot = { dstVkImage, dstFormat, dstWidth, dstHeight, dstImage };
++    }
++
++    VkExtent3D srcExtent = srcTextureInfo->GetExtentMip(src->GetMipLevel());
++    VkImageSubresource srcSub = srcTextureInfo->GetSubresourceFromIndex(VK_IMAGE_ASPECT_COLOR_BIT, src->GetSubresource());
++    VkImageSubresourceLayers srcLayers = { srcSub.aspectMask, srcSub.mipLevel, srcSub.arrayLayer, 1u };
++    VkImageSubresourceLayers dstLayers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
++
++    if (srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
++      auto resolveSrc = srcTextureInfo->GetResolveImage();
++      VkImageResolve region = {};
++      region.srcSubresource = srcLayers;
++      region.srcOffset      = { 0, 0, 0 };
++      region.dstSubresource = srcLayers;
++      region.dstOffset      = { 0, 0, 0 };
++      region.extent         = srcExtent;
++      EmitCs([
++        cDstImage = resolveSrc,
++        cSrcImage = srcImage,
++        cRegion   = region
++      ] (DxvkContext* ctx) {
++        ctx->resolveImage(cDstImage, cSrcImage, cRegion, VK_FORMAT_UNDEFINED);
++      });
++      srcImage = resolveSrc;
++    }
++
++    // Same format and size: a plain copy. A blit goes through a render pass with a shader, and that
++    // into the phone's buffer (an imported AHardwareBuffer) lost the device on Mali.
++    if (srcImage->info().format == dstFormat && srcExtent.width == dstWidth && srcExtent.height == dstHeight) {
++      EmitCs([
++        cDstImage = dstImage,
++        cSrcImage = srcImage,
++        cDstLayers = dstLayers,
++        cSrcLayers = srcLayers,
++        cExtent = VkExtent3D { dstWidth, dstHeight, 1u }
++      ] (DxvkContext* ctx) {
++        ctx->copyImage(cDstImage, cDstLayers, VkOffset3D { 0, 0, 0 },
++                       cSrcImage, cSrcLayers, VkOffset3D { 0, 0, 0 }, cExtent);
++      });
++      Flush();
++      SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
++      return D3D_OK;
++    }
++
++    VkImageBlit blitInfo = {};
++    blitInfo.srcSubresource = srcLayers;
++    blitInfo.srcOffsets[0]  = { 0, 0, 0 };
++    blitInfo.srcOffsets[1]  = { int32_t(srcExtent.width), int32_t(srcExtent.height), 1 };
++    blitInfo.dstSubresource = dstLayers;
++    blitInfo.dstOffsets[0]  = { 0, 0, 0 };
++    blitInfo.dstOffsets[1]  = { int32_t(dstWidth), int32_t(dstHeight), 1 };
++
++    VkComponentMapping dstMap = {
++      VK_COMPONENT_SWIZZLE_IDENTITY,
++      VK_COMPONENT_SWIZZLE_IDENTITY,
++      VK_COMPONENT_SWIZZLE_IDENTITY,
++      VK_COMPONENT_SWIZZLE_IDENTITY,
++    };
++
++    EmitCs([
++      cDstImage = dstImage,
++      cDstMap   = dstMap,
++      cSrcImage = srcImage,
++      cSrcMap   = srcTextureInfo->GetMapping().Swizzle,
++      cBlitInfo = blitInfo
++    ] (DxvkContext* ctx) {
++      ctx->blitImage(
++        cDstImage,
++        cDstMap,
++        cSrcImage,
++        cSrcMap,
++        cBlitInfo,
++        VK_FILTER_NEAREST);
++    });
++
++    Flush();
++    SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
++    return D3D_OK;
++  }
++
+ }
+diff --git a/src/d3d9/d3d9_device.h b/src/d3d9/d3d9_device.h
+index 6ce598a..3a82903 100644
+--- a/src/d3d9/d3d9_device.h
++++ b/src/d3d9/d3d9_device.h
+@@ -966,6 +966,13 @@ namespace dxvk {
+       return m_d3dCompatibility.test(d3dCompatibility);
+     }
+ 
++    HRESULT BlitToVkImage(
++            IDirect3DSurface9* pSourceSurface,
++            VkImage            dstVkImage,
++            VkFormat           dstFormat,
++            uint32_t           dstWidth,
++            uint32_t           dstHeight);
++
+   private:
+ 
+     DxvkCsChunkRef AllocCsChunk() {
+@@ -1351,6 +1358,16 @@ namespace dxvk {
+     std::atomic<int64_t>            m_availableMemory = { 0 };
+     std::atomic<int32_t>            m_samplerCount    = { 0 };
+ 
++    struct ScanoutImageEntry {
++      VkImage        vkImage = VK_NULL_HANDLE;
++      VkFormat       format  = VK_FORMAT_UNDEFINED;
++      uint32_t       width   = 0;
++      uint32_t       height  = 0;
++      Rc<DxvkImage>  image;
++    };
++    std::array<ScanoutImageEntry, 4> m_scanoutImages = { };
++    uint32_t                         m_scanoutImageNext = 0;
++
+     // m_state should be declared last (i.e. freed first), because it
+     // references objects that can call back into the device when freed.
+     Direct3DState9                  m_state;
+diff --git a/src/d3d9/d3d9_main.cpp b/src/d3d9/d3d9_main.cpp
+index e182b5f..ea3a1f6 100644
+--- a/src/d3d9/d3d9_main.cpp
++++ b/src/d3d9/d3d9_main.cpp
+@@ -101,4 +101,29 @@ extern "C" {
+   DLLEXPORT void __stdcall Direct3D9ForceHybridEnumeration(UINT uHybrid) {
+   }
+ 
++  DLLEXPORT void hwd3d9_get_vk_handles(
++          IDirect3DDevice9Ex* pDevice,
++          VkInstance*         pInstance,
++          VkPhysicalDevice*   pPhysDev,
++          VkDevice*           pVkDevice) {
++    if (!pDevice) return;
++    auto* dev = static_cast<dxvk::D3D9DeviceEx*>(pDevice);
++    auto dxvkDev = dev->GetDXVKDevice();
++    if (pInstance) *pInstance = dxvkDev->instance()->handle();
++    if (pPhysDev)  *pPhysDev  = dxvkDev->adapter()->handle();
++    if (pVkDevice) *pVkDevice = dxvkDev->handle();
++  }
++
++  DLLEXPORT HRESULT hwd3d9_blit_to_vkimage(
++          IDirect3DDevice9Ex* pDevice,
++          IDirect3DSurface9*  pSurface,
++          VkImage             dstVkImage,
++          uint32_t            dstFormat,
++          uint32_t            dstWidth,
++          uint32_t            dstHeight) {
++    if (!pDevice || !pSurface) return D3DERR_INVALIDCALL;
++    auto* dev = static_cast<dxvk::D3D9DeviceEx*>(pDevice);
++    return dev->BlitToVkImage(pSurface, dstVkImage, VkFormat(dstFormat), dstWidth, dstHeight);
++  }
++
+ }
+diff --git a/src/d3d9/d3d9_query.cpp b/src/d3d9/d3d9_query.cpp
+index 8aaea3a..7123bf8 100644
+--- a/src/d3d9/d3d9_query.cpp
++++ b/src/d3d9/d3d9_query.cpp
+@@ -1,4 +1,7 @@
+ #include "d3d9_query.h"
++#ifdef __ANDROID__
++#include <sys/system_properties.h>
++#endif
+ 
+ #include "d3d9_device.h"
+ 
+@@ -117,6 +120,7 @@ namespace dxvk {
+           m_parent->Begin(this);
+ 
+         m_resetCtr.fetch_add(1);
++        m_endMark.store(~uint64_t(0));   // not known until the CS thread has recorded the end
+ 
+         m_parent->End(this);
+ 
+@@ -175,6 +179,19 @@ namespace dxvk {
+     if (m_resetCtr != 0u)
+       return S_FALSE;
+ 
++    // HyperWin: a result is read only once the submission that holds the end of the query has finished. The driver
++    // (Mali) can block a result read behind a long draw of the submission thread; this way it never does, and the
++    // game gets its answer when the GPU has it, as on a PC. HWD3D_QUERY_GATE=0 reads at once, as before.
++    if (m_queryType != D3DQUERYTYPE_EVENT && QueryGateOn()) {
++      const uint64_t mark = m_endMark.load();
++      if (mark != 0 && mark != ~uint64_t(0)) {
++        if (m_parent->GetDXVKDevice()->submissionsDone() < mark)
++          return S_FALSE;
++      } else if (mark == ~uint64_t(0)) {
++        return S_FALSE;
++      }
++    }
++
+     if (m_queryType == D3DQUERYTYPE_EVENT) {
+       DxvkGpuEventStatus status = m_event[0]->test();
+ 
+@@ -297,10 +314,27 @@ namespace dxvk {
+       default: break;
+     }
+ 
++    // The command list this end went into is the next one handed to the driver.
++    m_endMark.store(m_parent->GetDXVKDevice()->submissionsMade() + 1);
+     m_resetCtr.fetch_sub(1);
+   }
+ 
+ 
++  bool D3D9Query::QueryGateOn() {
++    static const bool on = []() {
++#ifdef __ANDROID__
++      char prop[PROP_VALUE_MAX] = {};
++      if (__system_property_get("debug.hwd3d.qgate", prop) > 0) return prop[0] != '0';
++#endif
++      const char* v = std::getenv("HWD3D_QUERY_GATE");
++      return !(v && v[0] == '0');
++    }();
++    static const bool told = [](bool g) { Logger::info(g ? "D3D9 query gate: on (a result is read once the submission holding its end has finished)" : "D3D9 query gate: off"); return true; }(on);
++    (void)told;
++    return on;
++  }
++
++
+   bool D3D9Query::QueryBeginnable(D3DQUERYTYPE QueryType) {
+     return QueryType == D3DQUERYTYPE_OCCLUSION
+         || QueryType == D3DQUERYTYPE_VERTEXSTATS
+diff --git a/src/d3d9/d3d9_query.h b/src/d3d9/d3d9_query.h
+index 8d742c9..716fef7 100644
+--- a/src/d3d9/d3d9_query.h
++++ b/src/d3d9/d3d9_query.h
+@@ -46,6 +46,7 @@ namespace dxvk {
+     void Begin(DxvkContext* ctx);
+     void End(DxvkContext* ctx);
+ 
++    static bool QueryGateOn();
+     static bool QueryBeginnable(D3DQUERYTYPE QueryType);
+     static bool QueryEndable(D3DQUERYTYPE QueryType);
+ 
+@@ -81,6 +82,7 @@ namespace dxvk {
+     bool     m_stallFlag = false;
+ 
+     std::atomic<uint32_t> m_resetCtr = { 0u };
++    std::atomic<uint64_t> m_endMark  = { 0u };   // the submission that holds the end of the query (HyperWin)
+ 
+     D3D9_QUERY_DATA m_dataCache;
+ 
+diff --git a/src/d3d9/d3d9_surface.cpp b/src/d3d9/d3d9_surface.cpp
+index 31dc7ad..e185387 100644
+--- a/src/d3d9/d3d9_surface.cpp
++++ b/src/d3d9/d3d9_surface.cpp
+@@ -155,7 +155,11 @@ namespace dxvk {
+     createInfo.Width       = desc.Width;
+     createInfo.Height      = desc.Height;
+     createInfo.Pitch       = lockedRect.Pitch;
++#ifdef _WIN32
+     createInfo.hDeviceDc   = CreateCompatibleDC(NULL);
++#else
++    createInfo.hDeviceDc   = nullptr;
++#endif
+     createInfo.pColorTable = nullptr;
+ 
+     // Out...
+@@ -165,7 +169,9 @@ namespace dxvk {
+     if (D3DKMTCreateDCFromMemory(&createInfo))
+       Logger::err("D3D9: Failed to create GDI DC");
+ 
++#ifdef _WIN32
+     DeleteDC(createInfo.hDeviceDc);
++#endif
+ 
+     // These should now be set...
+     m_dcDesc.hDC     = createInfo.hDc;
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+index 792cc02..1c4e4e2 100644
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -9,6 +9,7 @@
+ namespace dxvk {
+ 
+ 
++#ifdef _WIN32
+   struct D3D9WindowData {
+     bool unicode;
+     bool filter;
+@@ -171,6 +172,14 @@ namespace dxvk {
+       CallWindowProcW, CallWindowProcA, unicode,
+         windowData.proc, window, message, wparam, lparam);
+   }
++#else
++  class D3D9WindowMessageFilter {
++  public:
++    D3D9WindowMessageFilter(HWND, bool = true) {}
++  };
++  inline void ResetWindowProc(HWND) {}
++  inline void HookWindowProc(HWND, D3D9SwapChainEx*) {}
++#endif
+ 
+ 
+   static uint16_t MapGammaControlPoint(float x) {
+diff --git a/src/d3d9/d3d9_util.cpp b/src/d3d9/d3d9_util.cpp
+index dc651ad..b97e626 100644
+--- a/src/d3d9/d3d9_util.cpp
++++ b/src/d3d9/d3d9_util.cpp
+@@ -15,6 +15,7 @@ namespace dxvk {
+           BOOL       EnableColorCode,
+           char*      pComments,
+           ID3DBlob** ppDisassembly) {
++#ifdef _WIN32
+     if (g_pfnDisassembleShader == nullptr) {
+       HMODULE d3d9x = LoadLibraryA("d3dx9.dll");
+ 
+@@ -33,6 +34,9 @@ namespace dxvk {
+       EnableColorCode,
+       pComments,
+       ppDisassembly);
++#else
++    return D3DERR_INVALIDCALL;
++#endif
+   }
+ 
+ 
+diff --git a/src/d3d9/meson.build b/src/d3d9/meson.build
+index 34f4be6..8f292ed 100644
+--- a/src/d3d9/meson.build
++++ b/src/d3d9/meson.build
+@@ -1,4 +1,4 @@
+-d3d9_res = wrc_generator.process('version.rc')
++d3d9_res = dxvk_is_native ? [] : wrc_generator.process('version.rc')
+ 
+ d3d9_shaders = files([
+   'shaders/d3d9_convert_yuy2_uyvy.comp',
+@@ -44,12 +44,14 @@ d3d9_src = [
+   'd3d9_bridge.cpp'
+ ]
+ 
++d3d9_link_args = dxvk_is_native ? ['-Wl,--version-script=' + meson.current_source_dir() + '/d3d9.sym'] : []
++
+ d3d9_dll = shared_library('d3d9'+dll_ext, d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
+-  name_prefix         : '',
++  name_prefix         : dxvk_name_prefix,
+   dependencies        : [ dxso_dep, dxvk_dep ],
+   include_directories : dxvk_include_path,
++  link_args           : d3d9_link_args,
+   install             : true,
+-  vs_module_defs      : 'd3d9'+def_spec_ext,
+ )
+ 
+ d3d9_dep = declare_dependency(
+diff --git a/src/dxgi/dxgi_adapter.cpp b/src/dxgi/dxgi_adapter.cpp
+index 7537680..59f3db1 100644
+--- a/src/dxgi/dxgi_adapter.cpp
++++ b/src/dxgi/dxgi_adapter.cpp
+@@ -456,7 +456,9 @@ namespace dxvk {
+ 
+     // This method seems to fire the
+     // event immediately on Windows
++#ifdef _WIN32
+     SetEvent(hEvent);
++#endif
+ 
+     *pdwCookie = cookie;
+     return S_OK;
+@@ -511,7 +513,11 @@ namespace dxvk {
+         memoryInfoOld = memoryInfoNew;
+ 
+         for (const auto& pair : m_eventMap)
++#ifdef _WIN32
+           SetEvent(pair.second);
++#else
++          (void)pair;
++#endif
+       }
+     }
+   }
+diff --git a/src/dxgi/dxgi_include.h b/src/dxgi/dxgi_include.h
+index dd9cd06..dbdee51 100644
+--- a/src/dxgi/dxgi_include.h
++++ b/src/dxgi/dxgi_include.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ //for some reason we need to specify __declspec(dllexport) for MinGW
+-#if defined(__WINE__)
++#if defined(__WINE__) || !defined(_WIN32)
+   #define DLLEXPORT __attribute__((visibility("default")))
+ #elif defined(_MSC_VER)
+   #define DLLEXPORT
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index 7f2395f..bd4ef61 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -172,7 +172,11 @@ namespace dxvk {
+     pStats->PresentCount = m_presentCount;
+     pStats->PresentRefreshCount = 0;
+     pStats->SyncRefreshCount = 0;
++#ifdef _WIN32
+     QueryPerformanceCounter(&pStats->SyncQPCTime);
++#else
++    pStats->SyncQPCTime.QuadPart = 0;
++#endif
+     pStats->SyncGPUTime.QuadPart = 0;
+     return S_OK;
+   }
+diff --git a/src/dxgi/meson.build b/src/dxgi/meson.build
+index daa790f..3099fb2 100644
+--- a/src/dxgi/meson.build
++++ b/src/dxgi/meson.build
+@@ -1,4 +1,4 @@
+-dxgi_res = wrc_generator.process('version.rc')
++dxgi_res = dxvk_is_native ? [] : wrc_generator.process('version.rc')
+ 
+ dxgi_src = [
+   'dxgi_adapter.cpp',
+@@ -7,17 +7,19 @@ dxgi_src = [
+   'dxgi_format.cpp',
+   'dxgi_main.cpp',
+   'dxgi_monitor.cpp',
+-  'dxgi_options.cpp',
+   'dxgi_output.cpp',
+   'dxgi_swapchain.cpp',
++  'dxgi_options.cpp',
+ ]
+ 
++dxgi_link_args = dxvk_is_native ? ['-Wl,--version-script=' + meson.current_source_dir() + '/dxgi.sym'] : []
++
+ dxgi_dll = shared_library('dxgi'+dll_ext, dxgi_src, dxgi_res,
+-  name_prefix         : '',
++  name_prefix         : dxvk_name_prefix,
+   dependencies        : [ dxvk_dep ],
+   include_directories : dxvk_include_path,
++  link_args           : dxgi_link_args,
+   install             : true,
+-  vs_module_defs      : 'dxgi'+def_spec_ext,
+ )
+ 
+ dxgi_dep = declare_dependency(
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index e6a6730..e4d235b 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -267,7 +267,7 @@ namespace dxvk {
+           DxvkDeviceFeatures  enabledFeatures) {
+     DxvkDeviceExtensions devExtensions;
+ 
+-    std::array<DxvkExt*, 32> devExtensionList = {{
++    std::array<DxvkExt*, 34> devExtensionList = {{
+       &devExtensions.amdMemoryOverallocationBehaviour,
+       &devExtensions.amdShaderFragmentMask,
+       &devExtensions.ext4444Formats,
+@@ -292,6 +292,8 @@ namespace dxvk {
+       &devExtensions.khrDrawIndirectCount,
+       &devExtensions.khrDriverProperties,
+       &devExtensions.khrExternalMemoryWin32,
++      &devExtensions.androidExternalMemoryAhb,
++      &devExtensions.extQueueFamilyForeign,
+       &devExtensions.khrExternalSemaphoreWin32,
+       &devExtensions.khrImageFormatList,
+       &devExtensions.khrSamplerMirrorClampToEdge,
+diff --git a/src/dxvk/dxvk_device.h b/src/dxvk/dxvk_device.h
+index 1e96316..b4be322 100644
+--- a/src/dxvk/dxvk_device.h
++++ b/src/dxvk/dxvk_device.h
+@@ -451,6 +451,9 @@ namespace dxvk {
+       return m_submissionQueue.pendingSubmissions();
+     }
+ 
++    uint64_t submissionsMade() const { return m_submissionQueue.submissionsMade(); }
++    uint64_t submissionsDone() const { return m_submissionQueue.submissionsDone(); }
++
+     /**
+      * \brief Increments a given stat counter
+      *
+diff --git a/src/dxvk/dxvk_extensions.h b/src/dxvk/dxvk_extensions.h
+index 160f39f..304235a 100644
+--- a/src/dxvk/dxvk_extensions.h
++++ b/src/dxvk/dxvk_extensions.h
+@@ -300,6 +300,8 @@ namespace dxvk {
+     DxvkExt khrDrawIndirectCount              = { VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME,                DxvkExtMode::Optional };
+     DxvkExt khrDriverProperties               = { VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME,                  DxvkExtMode::Optional };
+     DxvkExt khrExternalMemoryWin32            = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,              DxvkExtMode::Optional };
++    DxvkExt androidExternalMemoryAhb          = { "VK_ANDROID_external_memory_android_hardware_buffer",     DxvkExtMode::Optional };
++    DxvkExt extQueueFamilyForeign             = { "VK_EXT_queue_family_foreign",                            DxvkExtMode::Optional };
+     DxvkExt khrExternalSemaphoreWin32         = { VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,           DxvkExtMode::Optional };
+     DxvkExt khrImageFormatList                = { VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,                  DxvkExtMode::Optional };
+     DxvkExt khrSamplerMirrorClampToEdge       = { VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME,       DxvkExtMode::Optional };
+diff --git a/src/dxvk/dxvk_fence.cpp b/src/dxvk/dxvk_fence.cpp
+index fc79584..28efead 100644
+--- a/src/dxvk/dxvk_fence.cpp
++++ b/src/dxvk/dxvk_fence.cpp
+@@ -45,6 +45,7 @@ namespace dxvk {
+     if (vr != VK_SUCCESS)
+       throw DxvkError("Failed to create timeline semaphore");
+ 
++#ifdef _WIN32
+     if (info.sharedHandle != INVALID_HANDLE_VALUE) {
+       if (externalFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) {
+         VkImportSemaphoreWin32HandleInfoKHR importInfo = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+@@ -59,6 +60,7 @@ namespace dxvk {
+         Logger::warn(str::format("Importing semaphores of type ", info.sharedType, " not supported by device"));
+       }
+     }
++#endif
+ 
+     m_thread = dxvk::thread([this] { run(); });
+   }
+diff --git a/src/dxvk/dxvk_openvr.cpp b/src/dxvk/dxvk_openvr.cpp
+index f86a1ae..78adac0 100644
+--- a/src/dxvk/dxvk_openvr.cpp
++++ b/src/dxvk/dxvk_openvr.cpp
+@@ -1,3 +1,16 @@
++#include "dxvk_openvr.h"
++#ifndef _WIN32
++namespace dxvk {
++  VrInstance VrInstance::s_instance;
++  VrInstance::VrInstance() {}
++  VrInstance::~VrInstance() {}
++  std::string_view VrInstance::getName() { return "OpenVR"; }
++  DxvkNameSet VrInstance::getInstanceExtensions() { return DxvkNameSet(); }
++  DxvkNameSet VrInstance::getDeviceExtensions(uint32_t) { return DxvkNameSet(); }
++  void VrInstance::initInstanceExtensions() {}
++  void VrInstance::initDeviceExtensions(const DxvkInstance*) {}
++}
++#else
+ #include "dxvk_instance.h"
+ #include "dxvk_openvr.h"
+ 
+@@ -328,3 +341,5 @@ namespace dxvk {
+   }
+ 
+ }
++
++#endif
+diff --git a/src/dxvk/dxvk_openvr.h b/src/dxvk/dxvk_openvr.h
+index a7d1042..f43672a 100644
+--- a/src/dxvk/dxvk_openvr.h
++++ b/src/dxvk/dxvk_openvr.h
+@@ -12,6 +12,7 @@ namespace vr {
+ 
+ namespace dxvk {
+ 
++  class DxvkAdapter;
+   class DxvkInstance;
+ 
+   /**
+diff --git a/src/dxvk/dxvk_openxr.cpp b/src/dxvk/dxvk_openxr.cpp
+index b59acf4..68e7e41 100644
+--- a/src/dxvk/dxvk_openxr.cpp
++++ b/src/dxvk/dxvk_openxr.cpp
+@@ -1,3 +1,16 @@
++#include "dxvk_openxr.h"
++#ifndef _WIN32
++namespace dxvk {
++  DxvkXrProvider DxvkXrProvider::s_instance;
++  DxvkXrProvider::DxvkXrProvider() {}
++  DxvkXrProvider::~DxvkXrProvider() {}
++  std::string_view DxvkXrProvider::getName() { return "OpenXR"; }
++  DxvkNameSet DxvkXrProvider::getInstanceExtensions() { return DxvkNameSet(); }
++  DxvkNameSet DxvkXrProvider::getDeviceExtensions(uint32_t) { return DxvkNameSet(); }
++  void DxvkXrProvider::initInstanceExtensions() {}
++  void DxvkXrProvider::initDeviceExtensions(const DxvkInstance*) {}
++}
++#else
+ #include "dxvk_instance.h"
+ #include "dxvk_openxr.h"
+ 
+@@ -164,3 +177,5 @@ namespace dxvk {
+       ::GetProcAddress(m_wineOxr, sym));
+   }
+ }
++
++#endif
+diff --git a/src/dxvk/dxvk_queue.cpp b/src/dxvk/dxvk_queue.cpp
+index 86f0b4e..0b96f84 100644
+--- a/src/dxvk/dxvk_queue.cpp
++++ b/src/dxvk/dxvk_queue.cpp
+@@ -35,6 +35,7 @@ namespace dxvk {
+     entry.submit = std::move(submitInfo);
+ 
+     m_pending += 1;
++    m_made += 1;
+     m_submitQueue.push(std::move(entry));
+     m_appendCond.notify_all();
+   }
+@@ -128,7 +129,22 @@ namespace dxvk {
+       } else if (status == VK_ERROR_DEVICE_LOST || entry.submit.cmdList != nullptr) {
+         Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
+         m_lastError = status;
+-        m_device->waitForIdle();
++        // Not m_device->waitForIdle(): it waits for this queue to drain under m_mutex, which this
++        // thread holds with the failed entry still queued. Every later wait on a resource then
++        // blocked for good and the program hung.
++        { std::lock_guard<dxvk::mutex> queueLock(m_mutexQueue);
++          m_device->vkd()->vkDeviceWaitIdle(m_device->handle());
++        }
++        // The list never reaches the finish thread, so what that thread does for it is done here:
++        // its resources stop being in use and its events fire, or their waiters wait for good.
++        if (entry.submit.cmdList != nullptr) {
++          entry.submit.cmdList->notifyObjects();
++          entry.submit.cmdList->reset();
++          m_device->recycleCommandList(entry.submit.cmdList);
++          m_pending -= 1;
++          m_done += 1;
++          m_finishCond.notify_all();
++        }
+       }
+ 
+       m_submitQueue.pop();
+@@ -178,6 +194,7 @@ namespace dxvk {
+ 
+       lock.lock();
+       m_pending -= 1;
++          m_done += 1;
+ 
+       m_finishQueue.pop();
+       m_finishCond.notify_all();
+diff --git a/src/dxvk/dxvk_queue.h b/src/dxvk/dxvk_queue.h
+index 374da55..71c79c0 100644
+--- a/src/dxvk/dxvk_queue.h
++++ b/src/dxvk/dxvk_queue.h
+@@ -80,6 +80,11 @@ namespace dxvk {
+       return m_pending.load();
+     }
+ 
++    /** Submissions handed over so far and finished so far (HyperWin: a D3D9 query is readable once the one that
++     *  holds its end has finished, see D3D9Query::GetQueryData). */
++    uint64_t submissionsMade() const { return m_made.load(); }
++    uint64_t submissionsDone() const { return m_done.load(); }
++
+     /**
+      * \brief Retrieves estimated GPU idle time
+      *
+@@ -183,6 +188,8 @@ namespace dxvk {
+     
+     std::atomic<bool>       m_stopped = { false };
+     std::atomic<uint32_t>   m_pending = { 0u };
++    std::atomic<uint64_t>   m_made    = { 0u };
++    std::atomic<uint64_t>   m_done    = { 0u };
+     std::atomic<uint64_t>   m_gpuIdle = { 0ull };
+ 
+     dxvk::mutex                 m_mutex;
+diff --git a/src/dxvk/platform/dxvk_win32_exts.cpp b/src/dxvk/platform/dxvk_win32_exts.cpp
+index 25c81cc..3bd65de 100644
+--- a/src/dxvk/platform/dxvk_win32_exts.cpp
++++ b/src/dxvk/platform/dxvk_win32_exts.cpp
+@@ -1,17 +1,23 @@
+ #include "../dxvk_platform_exts.h"
++#include "../../wsi/wsi_platform.h"
+ 
+ namespace dxvk {
+ 
+   DxvkPlatformExts DxvkPlatformExts::s_instance;
+ 
+   std::string_view DxvkPlatformExts::getName() {
++#ifdef DXVK_WSI_ANDROID
++    return "Android WSI";
++#else
+     return "Win32 WSI";
++#endif
+   }
+ 
+ 
+   DxvkNameSet DxvkPlatformExts::getInstanceExtensions() {
+     DxvkNameSet names;
+-    names.add(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
++    for (const char* ext : wsi::getInstanceExtensions())
++      names.add(ext);
+ 
+     return names;
+   }
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index efa2695..1ad5a55 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -2374,8 +2374,15 @@ namespace dxvk {
+     // Open the file if it exists
+     std::ifstream stream(str::tows(filePath.c_str()).c_str());
+ 
+-    if (!stream && confLine.empty())
++    const std::string& hwConf = env::getHwd3dConf();
++
++    if (!stream && confLine.empty() && hwConf.empty()) {
++      if (env::isHwd3dDesktop()) {
++        config.setOption("dxgi.syncInterval", "0");
++        config.setOption("d3d9.presentInterval", "0");
++      }
+       return config;
++    }
+ 
+     // Initialize parser context
+     ConfigContext ctx;
+@@ -2393,6 +2400,17 @@ namespace dxvk {
+         parseUserConfigLine(config, ctx, line);
+     }
+ 
++    if (!hwConf.empty()) {
++      Logger::info("Found the program's dxvk.conf");
++      std::istringstream hw(hwConf);
++      std::string line;
++      while (std::getline(hw, line)) {
++        if (!line.empty() && line.back() == '\r')
++          line.pop_back();
++        parseUserConfigLine(config, ctx, line);
++      }
++    }
++
+     if (!confLine.empty()) {
+       ctx.active = true;
+ 
+@@ -2404,6 +2422,11 @@ namespace dxvk {
+         parseUserConfigLine(config, ctx, std::string(l.data(), l.size()));
+     }
+ 
++    if (env::isHwd3dDesktop()) {
++      config.setOption("dxgi.syncInterval", "0");
++      config.setOption("d3d9.presentInterval", "0");
++    }
++
+     return config;
+   }
+ 
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index f906fb4..2f0f9e1 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -2,6 +2,10 @@
+ 
+ #include "log.h"
+ 
++#ifdef __ANDROID__
++#include <android/log.h>
++#endif
++
+ #include "../util_env.h"
+ 
+ namespace dxvk {
+@@ -87,8 +91,16 @@ namespace dxvk {
+ #endif
+         }
+ 
+-        if (m_fileStream)
++        if (m_fileStream) {
+           m_fileStream << adjusted;
++          // A warning or an error is often the last line before a hang: it must reach the file.
++          if (level >= LogLevel::Warn)
++            m_fileStream.flush();
++        }
++#ifdef __ANDROID__
++        if (level >= LogLevel::Warn)
++          __android_log_print(level >= LogLevel::Error ? ANDROID_LOG_ERROR : ANDROID_LOG_WARN, "dxvk", "%s", adjusted.c_str());
++#endif
+       }
+     }
+   }
+diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
+index 7e93593..e81d96b 100644
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -51,7 +51,7 @@ namespace dxvk::env {
+ 
+   std::string getExeName() {
+     std::string fullPath = getExePath();
+-    auto n = fullPath.find_last_of(env::PlatformDirSlash);
++    auto n = fullPath.find_last_of("/\\");
+     
+     return (n != std::string::npos)
+       ? fullPath.substr(n + 1)
+@@ -72,7 +72,39 @@ namespace dxvk::env {
+   }
+ 
+ 
++  thread_local std::string g_hwd3dExe, g_hwd3dConf;
++
++  const std::string& getHwd3dConf() { return g_hwd3dConf; }
++
++  bool isHwd3dDesktop() {
++    if (g_hwd3dExe.empty())
++      return true;
++    std::string low = g_hwd3dExe;
++    for (char& ch : low) {
++      if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
++      else if (ch == '/') ch = '\\';
++    }
++    if (low.size() >= 11 && low[1] == ':' && low.compare(2, 9, "\\windows\\") == 0)
++      return true;
++    size_t slash = low.find_last_of('\\');
++    std::string base = (slash == std::string::npos) ? low : low.substr(slash + 1);
++    static const char* const kShellApps[] = {
++      "startmenuexperiencehost.exe",
++      "shellexperiencehost.exe",
++      "searchhost.exe",
++      "textinputhost.exe",
++      "systemsettings.exe",
++    };
++    for (const char* app : kShellApps) {
++      if (base == app)
++        return true;
++    }
++    return false;
++  }
++
+   std::string getExePath() {
++    if (!g_hwd3dExe.empty())
++      return g_hwd3dExe;
+ #if defined(_WIN32)
+     std::vector<WCHAR> exePath;
+     exePath.resize(MAX_PATH + 1);
+@@ -122,3 +154,12 @@ namespace dxvk::env {
+   }
+   
+ }
++
++extern "C" __attribute__((visibility("default"))) void hwd3d_set_program(const char* exe, const char* conf) {
++  dxvk::env::g_hwd3dExe = exe ? exe : "";
++  dxvk::env::g_hwd3dConf = conf ? conf : "";
++}
++
++extern "C" __attribute__((visibility("default"))) unsigned hwd3d_abi_version() {
++  return 1;
++}
+diff --git a/src/util/util_env.h b/src/util/util_env.h
+index 80efcbc..6636992 100644
+--- a/src/util/util_env.h
++++ b/src/util/util_env.h
+@@ -61,6 +61,10 @@ namespace dxvk::env {
+    * \returns Path to executable
+    */
+   std::string getExePath();
++
++  const std::string& getHwd3dConf();
++  bool isHwd3dDesktop();
++  extern thread_local std::string g_hwd3dExe, g_hwd3dConf;
+   
+   /**
+    * \brief Sets name of the calling thread
+diff --git a/src/util/util_fps_limiter.cpp b/src/util/util_fps_limiter.cpp
+index e4d90d2..987204a 100644
+--- a/src/util/util_fps_limiter.cpp
++++ b/src/util/util_fps_limiter.cpp
+@@ -272,6 +272,7 @@ namespace dxvk {
+ 
+ 
+   void FpsLimiter::initialize() {
++#ifdef _WIN32
+     HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+ 
+     if (ntdll) {
+@@ -294,7 +295,9 @@ namespace dxvk {
+           m_sleepGranularity = NtTimerDuration(max);
+         }
+       }
+-    } else {
++    } else
++#endif
++    {
+       // Assume 1ms sleep granularity by default
+       m_sleepGranularity = NtTimerDuration(10000);
+     }
+diff --git a/src/util/util_gdi.cpp b/src/util/util_gdi.cpp
+index 9ed361e..d799356 100644
+--- a/src/util/util_gdi.cpp
++++ b/src/util/util_gdi.cpp
+@@ -3,6 +3,7 @@
+ 
+ namespace dxvk {
+ 
++#ifdef _WIN32
+   HMODULE GetGDIModule() {
+     static HMODULE module = LoadLibraryA("gdi32.dll");
+     return module;
+@@ -40,5 +41,11 @@ namespace dxvk {
+     Logger::warn("D3DKMTEscape: Unable to query proc address.");
+     return -1;
+   }
++#else
++  HMODULE GetGDIModule() { return nullptr; }
++  NTSTATUS D3DKMTCreateDCFromMemory(D3DKMT_CREATEDCFROMMEMORY*) { return -1; }
++  NTSTATUS D3DKMTDestroyDCFromMemory(D3DKMT_DESTROYDCFROMMEMORY*) { return -1; }
++  NTSTATUS D3DKMTEscape(const D3DKMT_ESCAPE*) { return -1; }
++#endif
+ 
+ }
+diff --git a/src/util/util_shared_res.cpp b/src/util/util_shared_res.cpp
+index 4253cdc..45e451b 100644
+--- a/src/util/util_shared_res.cpp
++++ b/src/util/util_shared_res.cpp
+@@ -7,6 +7,7 @@
+ 
+ namespace dxvk {
+ 
++#ifdef _WIN32
+   #define IOCTL_SHARED_GPU_RESOURCE_OPEN             CTL_CODE(FILE_DEVICE_VIDEO, 1, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+ 
+   HANDLE openKmtHandle(HANDLE kmt_handle) {
+@@ -45,5 +46,10 @@ namespace dxvk {
+       *metadataSize = retSize;
+     return ret;
+   }
++#else
++  HANDLE openKmtHandle(HANDLE) { return INVALID_HANDLE_VALUE; }
++  bool setSharedMetadata(HANDLE, void*, uint32_t) { return false; }
++  bool getSharedMetadata(HANDLE, void*, uint32_t, uint32_t*) { return false; }
++#endif
+ 
+ }
+diff --git a/src/util/util_string.cpp b/src/util/util_string.cpp
+index 2151c1e..72ed302 100644
+--- a/src/util/util_string.cpp
++++ b/src/util/util_string.cpp
+@@ -1,6 +1,7 @@
+ #include "util_string.h"
+ 
+ namespace dxvk::str {
++#ifdef _WIN32
+   std::string fromws(const WCHAR *ws) {
+     size_t len = ::WideCharToMultiByte(CP_UTF8,
+       0, ws, -1, nullptr, 0, nullptr, nullptr);
+@@ -39,5 +40,45 @@ namespace dxvk::str {
+       &result.at(0), len);
+     return result;
+   }
++#else
++  std::string fromws(const WCHAR *ws) {
++    if (!ws) return "";
++    std::string result;
++    for (const WCHAR* p = ws; *p; ++p) {
++      uint32_t c = uint16_t(*p);
++      if (c < 0x80) {
++        result.push_back(char(c));
++      } else if (c < 0x800) {
++        result.push_back(char(0xC0 | (c >> 6)));
++        result.push_back(char(0x80 | (c & 0x3F)));
++      } else {
++        result.push_back(char(0xE0 | (c >> 12)));
++        result.push_back(char(0x80 | ((c >> 6) & 0x3F)));
++        result.push_back(char(0x80 | (c & 0x3F)));
++      }
++    }
++    return result;
++  }
++
++  void tows(const char* mbs, WCHAR* wcs, size_t wcsLen) {
++    if (!wcs || !wcsLen) return;
++    size_t i = 0;
++    if (mbs) {
++      while (mbs[i] && i + 1 < wcsLen) {
++        wcs[i] = WCHAR(uint8_t(mbs[i]));
++        ++i;
++      }
++    }
++    wcs[i] = 0;
++  }
++
++  std::wstring tows(const char* mbs) {
++    std::wstring result;
++    if (!mbs) return result;
++    for (const char* p = mbs; *p; ++p)
++      result.push_back(wchar_t(uint8_t(*p)));
++    return result;
++  }
++#endif
+ 
+ }
+diff --git a/src/vulkan/vulkan_loader.cpp b/src/vulkan/vulkan_loader.cpp
+index df19c53..c116c3b 100644
+--- a/src/vulkan/vulkan_loader.cpp
++++ b/src/vulkan/vulkan_loader.cpp
+@@ -1,16 +1,66 @@
+ #include "vulkan_loader.h"
++#include "../util/log/log.h"
++#include "../util/util_string.h"
++#include "../util/util_env.h"
++
++#ifndef _WIN32
++#include <dlfcn.h>
++#include <cstdlib>
++#endif
+ 
+ namespace dxvk::vk {
+ 
+-  LibraryLoader::LibraryLoader()
+-  : m_library(LoadLibraryA("vulkan-1"))
+-  , m_getInstanceProcAddr(reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+-        GetProcAddress(m_library, "vkGetInstanceProcAddr"))) {
++  static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
++#ifdef __ANDROID__
++    const bool desktop = env::isHwd3dDesktop();
++    if (!desktop) {
++      if (const char* wrapper = std::getenv("HWGPU_VK_LOADER")) {
++        if (void* library = dlopen(wrapper, RTLD_NOW | RTLD_LOCAL)) {
++          auto proc = dlsym(library, "vk_icdGetInstanceProcAddr");
++          if (proc) {
++            Logger::info(str::format("Vulkan: using ", wrapper));
++            return std::make_pair(reinterpret_cast<HMODULE>(library), reinterpret_cast<PFN_vkGetInstanceProcAddr>(proc));
++          }
++          dlclose(library);
++        }
++      }
++    }
++    if (void* library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL)) {
++      auto proc = dlsym(library, "vkGetInstanceProcAddr");
++      if (proc) {
++        Logger::info(desktop ? "Vulkan: using libvulkan.so (desktop stock driver, no layers)" : "Vulkan: using libvulkan.so");
++        return std::make_pair(reinterpret_cast<HMODULE>(library), reinterpret_cast<PFN_vkGetInstanceProcAddr>(proc));
++      }
++      dlclose(library);
++    }
++    return std::make_pair(nullptr, nullptr);
++#elif !defined(_WIN32)
++    if (void* library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL)) {
++      auto proc = dlsym(library, "vkGetInstanceProcAddr");
++      if (proc)
++        return std::make_pair(reinterpret_cast<HMODULE>(library), reinterpret_cast<PFN_vkGetInstanceProcAddr>(proc));
++      dlclose(library);
++    }
++    return std::make_pair(nullptr, nullptr);
++#else
++    HMODULE library = LoadLibraryA("vulkan-1");
++    auto proc = library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(library, "vkGetInstanceProcAddr")) : nullptr;
++    return std::make_pair(library, proc);
++#endif
++  }
++
++  LibraryLoader::LibraryLoader() {
++    std::tie(m_library, m_getInstanceProcAddr) = loadVulkanLibrary();
+   }
+ 
+   LibraryLoader::~LibraryLoader() {
+-    if (m_library)
++    if (m_library) {
++#ifdef _WIN32
+       FreeLibrary(m_library);
++#else
++      dlclose(m_library);
++#endif
++    }
+   }
+ 
+   PFN_vkVoidFunction LibraryLoader::sym(VkInstance instance, const char* name) const {
+diff --git a/src/vulkan/vulkan_loader.h b/src/vulkan/vulkan_loader.h
+index e263b16..5c060d7 100644
+--- a/src/vulkan/vulkan_loader.h
++++ b/src/vulkan/vulkan_loader.h
+@@ -26,8 +26,8 @@ namespace dxvk::vk {
+     PFN_vkGetInstanceProcAddr getLoaderProc() const { return m_getInstanceProcAddr; }
+     bool               valid() const;
+   protected:
+-    const HMODULE                   m_library;
+-    const PFN_vkGetInstanceProcAddr m_getInstanceProcAddr;
++    HMODULE                   m_library = nullptr;
++    PFN_vkGetInstanceProcAddr m_getInstanceProcAddr = nullptr;
+   };
+   
+   
+diff --git a/src/vulkan/vulkan_presenter.cpp b/src/vulkan/vulkan_presenter.cpp
+index 57c1737..e58bbcb 100644
+--- a/src/vulkan/vulkan_presenter.cpp
++++ b/src/vulkan/vulkan_presenter.cpp
+@@ -16,10 +16,12 @@ namespace dxvk::vk {
+     // As of Wine 5.9, winevulkan provides this extension, but does
+     // not filter the pNext chain for VkSwapchainCreateInfoKHR properly
+     // before passing it to the Linux sude, which breaks RenderDoc.
++#ifdef _WIN32
+     if (m_device.features.fullScreenExclusive && ::GetModuleHandle("winevulkan.dll")) {
+       Logger::warn("winevulkan detected, disabling exclusive fullscreen support");
+       m_device.features.fullScreenExclusive = false;
+     }
++#endif
+ 
+     if (createSurface() != VK_SUCCESS)
+       throw DxvkError("Failed to create surface");
+@@ -55,6 +57,11 @@ namespace dxvk::vk {
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+     }
+ 
++#ifdef __ANDROID__
++    if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++      m_acquireStatus = VK_SUCCESS;
++#endif
++
+     if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
+       return m_acquireStatus;
+ 
+@@ -78,6 +85,13 @@ namespace dxvk::vk {
+ 
+     VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
+ 
++#ifdef __ANDROID__
++    // HyperWin: Android reports suboptimal on every frame while rotated against the
++    // swapchain's identity transform. The compositor rotates it; recreating does not help.
++    if (status == VK_SUBOPTIMAL_KHR)
++      status = VK_SUCCESS;
++#endif
++
+     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
+       return status;
+ 
+@@ -91,6 +105,10 @@ namespace dxvk::vk {
+     m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+       m_swapchain, std::numeric_limits<uint64_t>::max(),
+       sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++#ifdef __ANDROID__
++    if (m_acquireStatus == VK_SUBOPTIMAL_KHR)
++      m_acquireStatus = VK_SUCCESS;
++#endif
+ 
+     bool vsync = m_info.presentMode == VK_PRESENT_MODE_FIFO_KHR
+               || m_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+diff --git a/src/wsi/meson.build b/src/wsi/meson.build
+index 2b1ab2b..b149286 100644
+--- a/src/wsi/meson.build
++++ b/src/wsi/meson.build
+@@ -1,10 +1,19 @@
+ wsi_src = [
+   'wsi_platform.cpp',
+-  'win32/wsi_monitor_win32.cpp',
+-  'win32/wsi_platform_win32.cpp',
+-  'win32/wsi_window_win32.cpp',
+ ]
+ 
++if platform == 'windows'
++  wsi_src += [
++    'win32/wsi_monitor_win32.cpp',
++    'win32/wsi_platform_win32.cpp',
++    'win32/wsi_window_win32.cpp',
++  ]
++elif platform == 'android'
++  wsi_src += [
++    'android/wsi_android.cpp',
++  ]
++endif
++
+ wsi_lib = static_library('wsi', wsi_src,
+   include_directories : [ dxvk_include_path ])
+ 
+diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
+index e4d9436..370e929 100644
+--- a/src/wsi/wsi_platform.cpp
++++ b/src/wsi/wsi_platform.cpp
+@@ -6,13 +6,23 @@
+ 
+ namespace dxvk::wsi {
+   static const WsiBootstrap *wsiBootstrap[] = {
++#if defined(DXVK_WSI_WIN32)
+     &Win32WSI,
++#endif
++#if defined(DXVK_WSI_ANDROID)
++    &AndroidWSI,
++#endif
+   };
+ 
+   static WsiDriver* createDriver() {
+     std::string hint = dxvk::env::getEnvVar("DXVK_WSI_DRIVER");
+-    if (hint == "")
++    if (hint == "") {
++#if defined(DXVK_WSI_WIN32)
+       hint = "Win32";
++#elif defined(DXVK_WSI_ANDROID)
++      hint = "Android";
++#endif
++    }
+ 
+     for (const WsiBootstrap *b : wsiBootstrap) {
+       WsiDriver *driver = nullptr;
+diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
+index 3db416d..0e27ed7 100644
+--- a/src/wsi/wsi_platform.h
++++ b/src/wsi/wsi_platform.h
+@@ -103,7 +103,12 @@ namespace dxvk::wsi {
+     bool (*createDriver)(WsiDriver **driver);
+   };
+ 
++#if defined(DXVK_WSI_WIN32)
+   extern WsiBootstrap Win32WSI;
++#endif
++#if defined(DXVK_WSI_ANDROID)
++  extern WsiBootstrap AndroidWSI;
++#endif
+ 
+   void init();
+   void quit();

@@ -1,0 +1,13 @@
+{
+  global:
+    CreateDXGIFactory2;
+    CreateDXGIFactory1;
+    CreateDXGIFactory;
+    DXGIDeclareAdapterRemovalSupport;
+    DXGIGetDebugInterface1;
+    hwd3d_set_program;
+    hwd3d_abi_version;
+
+  local:
+    *;
+};

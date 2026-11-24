@@ -1,0 +1,28 @@
+{
+  global:
+    Direct3DCreate9;
+    Direct3DCreate9Ex;
+    D3DPERF_BeginEvent;
+    D3DPERF_EndEvent;
+    D3DPERF_SetMarker;
+    D3DPERF_SetRegion;
+    D3DPERF_QueryRepeatFrame;
+    D3DPERF_SetOptions;
+    D3DPERF_GetStatus;
+    DebugSetMute;
+    DebugSetLevel;
+    PSGPError;
+    PSGPSampleTexture;
+    Direct3DShaderValidatorCreate9;
+    Direct3D9EnableMaximizedWindowedModeShim;
+    DXVK_RegisterAnnotation;
+    DXVK_UnRegisterAnnotation;
+    Direct3D9ForceHybridEnumeration;
+    hwd3d_set_program;
+    hwd3d_abi_version;
+    hwd3d9_get_vk_handles;
+    hwd3d9_blit_to_vkimage;
+
+  local:
+    *;
+};

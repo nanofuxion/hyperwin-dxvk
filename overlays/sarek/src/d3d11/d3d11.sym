@@ -1,0 +1,13 @@
+{
+  global:
+    hwd3d11_blit_swap_rb;
+    D3D11CoreCreateDevice;
+    D3D11CreateDevice;
+    D3D11CreateDeviceAndSwapChain;
+    D3D11On12CreateDevice;
+    hwd3d_set_program;
+    hwd3d_abi_version;
+
+  local:
+    *;
+};
